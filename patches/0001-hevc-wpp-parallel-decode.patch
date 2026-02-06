@@ -1,0 +1,1336 @@
+From 08da11300c700f7a0f038ed6f4196750f5919f29 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E4=BD=B0=E9=98=85?=
+ <43716063+Baiyuetribe@users.noreply.github.com>
+Date: Fri, 6 Feb 2026 19:22:58 +0800
+Subject: [PATCH] =?UTF-8?q?=E4=B8=80=E5=8F=A5=E8=AF=9D=E5=91=BD=E4=BB=A4?=
+ =?UTF-8?q?=E5=AE=8C=E6=88=90=E7=9A=84?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ libavcodec/hevc/Makefile  |   1 +
+ libavcodec/hevc/cabac.c   |  17 +
+ libavcodec/hevc/filter.c  |  45 +++
+ libavcodec/hevc/hevcdec.c |  87 +++-
+ libavcodec/hevc/hevcdec.h |  39 ++
+ libavcodec/hevc/refs.c    |   2 +-
+ libavcodec/hevc/thread.c  | 826 ++++++++++++++++++++++++++++++++++++++
+ libavcodec/hevc/thread.h  | 154 +++++++
+ 8 files changed, 1169 insertions(+), 2 deletions(-)
+ create mode 100644 libavcodec/hevc/thread.c
+ create mode 100644 libavcodec/hevc/thread.h
+
+diff --git a/libavcodec/hevc/Makefile b/libavcodec/hevc/Makefile
+index 93ed4213f6..0267858e0c 100644
+--- a/libavcodec/hevc/Makefile
++++ b/libavcodec/hevc/Makefile
+@@ -10,6 +10,7 @@ OBJS-$(CONFIG_HEVC_DECODER) += \
+     hevc/mvs.o                 \
+     hevc/pred.o                \
+     hevc/refs.o                \
++    hevc/thread.o              \
+ 
+ OBJS-$(CONFIG_HEVC_PARSER) += \
+     hevc/parser.o             \
+diff --git a/libavcodec/hevc/cabac.c b/libavcodec/hevc/cabac.c
+index 55d5741f87..c4e659117e 100644
+--- a/libavcodec/hevc/cabac.c
++++ b/libavcodec/hevc/cabac.c
+@@ -414,6 +414,23 @@ void ff_hevc_save_states(HEVCLocalContext *lc, const HEVCPPS *pps,
+     }
+ }
+ 
++// WPP: 保存 CABAC 状态 (CTU(1, y) 解析后调用)
++void ff_hevc_save_states_wpp(HEVCLocalContext *lc, int ctb_addr_ts)
++{
++    memcpy(lc->common_cabac_state->state, lc->cabac_state, HEVC_CONTEXTS);
++    memcpy(lc->common_cabac_state->stat_coeff, lc->stat_coeff, HEVC_STAT_COEFFS);
++}
++
++// WPP: 恢复 CABAC 状态 (CTU(0, y) 解析前调用)
++void ff_hevc_load_states_wpp(HEVCLocalContext *lc, const HEVCCABACState *src,
++                             const HEVCSPS *sps)
++{
++    memcpy(lc->cabac_state, src->state, HEVC_CONTEXTS);
++    if (sps->persistent_rice_adaptation_enabled) {
++        memcpy(lc->stat_coeff, src->stat_coeff, HEVC_STAT_COEFFS);
++    }
++}
++
+ static void load_states(HEVCLocalContext *lc, const HEVCSPS *sps)
+ {
+     memcpy(lc->cabac_state, lc->common_cabac_state->state, HEVC_CONTEXTS);
+diff --git a/libavcodec/hevc/filter.c b/libavcodec/hevc/filter.c
+index 68ae0e9ef6..572b1fa971 100644
+--- a/libavcodec/hevc/filter.c
++++ b/libavcodec/hevc/filter.c
+@@ -922,3 +922,48 @@ void ff_hevc_hls_filters(HEVCLocalContext *lc, const HEVCLayerContext *l,
+     if (x_ctb && y_end)
+         ff_hevc_hls_filter(lc, l, pps, x_ctb - ctb_size, y_ctb, ctb_size);
+ }
++
++// 拆分后的 Deblocking 滤波函数 (用于 CTU 级 WPP)
++void ff_hevc_deblock_filter_ctb(HEVCLocalContext *lc, const HEVCLayerContext *l,
++                                const HEVCPPS *pps, int x, int y, int ctb_size,
++                                int vertical)
++{
++    const HEVCSPS *const sps = pps->sps;
++    const HEVCContext *const s = lc->parent;
++    int skip = 0;
++
++    if (s->avctx->skip_loop_filter >= AVDISCARD_ALL ||
++        (s->avctx->skip_loop_filter >= AVDISCARD_NONKEY && !IS_IDR(s)) ||
++        (s->avctx->skip_loop_filter >= AVDISCARD_NONINTRA &&
++         s->sh.slice_type != HEVC_SLICE_I) ||
++        (s->avctx->skip_loop_filter >= AVDISCARD_BIDIR &&
++         s->sh.slice_type == HEVC_SLICE_B) ||
++        (s->avctx->skip_loop_filter >= AVDISCARD_NONREF &&
++         ff_hevc_nal_is_nonref(s->nal_unit_type)))
++        skip = 1;
++
++    if (!skip)
++        deblocking_filter_CTB(s, l, pps, sps, x, y);
++}
++
++// 拆分后的 SAO 滤波函数 (用于 CTU 级 WPP)
++void ff_hevc_sao_filter_ctb(HEVCLocalContext *lc, const HEVCLayerContext *l,
++                            const HEVCPPS *pps, int x, int y, int ctb_size)
++{
++    const HEVCSPS *const sps = pps->sps;
++    const HEVCContext *const s = lc->parent;
++    int skip = 0;
++
++    if (s->avctx->skip_loop_filter >= AVDISCARD_ALL ||
++        (s->avctx->skip_loop_filter >= AVDISCARD_NONKEY && !IS_IDR(s)) ||
++        (s->avctx->skip_loop_filter >= AVDISCARD_NONINTRA &&
++         s->sh.slice_type != HEVC_SLICE_I) ||
++        (s->avctx->skip_loop_filter >= AVDISCARD_BIDIR &&
++         s->sh.slice_type == HEVC_SLICE_B) ||
++        (s->avctx->skip_loop_filter >= AVDISCARD_NONREF &&
++         ff_hevc_nal_is_nonref(s->nal_unit_type)))
++        skip = 1;
++
++    if (sps->sao_enabled && !skip)
++        sao_filter_CTB(lc, l, s, pps, sps, x, y);
++}
+diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
+index 531d1c26f3..db124b0fdd 100644
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -55,8 +55,9 @@
+ #include "profiles.h"
+ #include "progressframe.h"
+ #include "libavutil/refstruct.h"
+-#include "thread.h"
++#include "../thread.h"
+ #include "threadprogress.h"
++#include "thread.h"
+ 
+ static const uint8_t hevc_pel_weight[65] = { [2] = 0, [4] = 1, [6] = 2, [8] = 3, [12] = 4, [16] = 5, [24] = 6, [32] = 7, [48] = 8, [64] = 9 };
+ 
+@@ -2747,6 +2748,67 @@ static void hls_decode_neighbour(HEVCLocalContext *lc,
+     lc->ctb_up_left_flag = ((x_ctb > 0) && (y_ctb > 0)  && (ctb_addr_in_slice-1 >= sps->ctb_width) && (pps->tile_id[ctb_addr_ts] == pps->tile_id[pps->ctb_addr_rs_to_ts[ctb_addr_rs-1 - sps->ctb_width]]));
+ }
+ 
++/**
++ * 解码单个 CTU (用于 CTU 级 WPP 并行)
++ *
++ * @param lc 本地上下文
++ * @param l layer 上下文
++ * @param ctb_addr_rs CTU 光栅扫描地址
++ * @param data slice 数据指针
++ * @param size slice 数据大小
++ * @param is_first_in_row 是否为行首 CTU (需要恢复 CABAC 状态)
++ * @return 0 成功, 1 还有更多数据, <0 错误
++ */
++int ff_hevc_decode_ctu(HEVCLocalContext *lc, HEVCLayerContext *l,
++                       int ctb_addr_rs, const uint8_t *data, size_t size,
++                       int is_first_in_row)
++{
++    HEVCContext *const s = lc->parent;
++    const HEVCPPS *const pps = s->pps;
++    const HEVCSPS *const sps = pps->sps;
++    int ctb_size = 1 << sps->log2_ctb_size;
++    int ctb_addr_ts = pps->ctb_addr_rs_to_ts[ctb_addr_rs];
++    int x_ctb = (ctb_addr_rs % sps->ctb_width) << sps->log2_ctb_size;
++    int y_ctb = (ctb_addr_rs / sps->ctb_width) << sps->log2_ctb_size;
++    int more_data;
++    int ret;
++
++    // 1. 设置邻居标志
++    hls_decode_neighbour(lc, l, pps, sps, x_ctb, y_ctb, ctb_addr_ts);
++
++    // 2. CABAC 初始化
++    ret = ff_hevc_cabac_init(lc, pps, ctb_addr_ts, data, size, 1);
++    if (ret < 0) {
++        l->tab_slice_address[ctb_addr_rs] = -1;
++        return ret;
++    }
++
++    // 3. SAO 参数解析
++    hls_sao_param(lc, l, pps, sps,
++                  x_ctb >> sps->log2_ctb_size, y_ctb >> sps->log2_ctb_size);
++
++    // 4. 设置 deblock 参数
++    l->deblock[ctb_addr_rs].beta_offset = s->sh.beta_offset;
++    l->deblock[ctb_addr_rs].tc_offset   = s->sh.tc_offset;
++    l->filter_slice_edges[ctb_addr_rs]  = s->sh.slice_loop_filter_across_slices_enabled_flag;
++
++    // 5. 编码四叉树解析
++    more_data = hls_coding_quadtree(lc, l, pps, sps, x_ctb, y_ctb,
++                                    sps->log2_ctb_size, 0);
++    if (more_data < 0) {
++        l->tab_slice_address[ctb_addr_rs] = -1;
++        return more_data;
++    }
++
++    // 6. 保存 CABAC 状态 (WPP: CTU(1,y) 后保存，用于下一行)
++    // 列索引为 1 时保存状态
++    if ((ctb_addr_rs % sps->ctb_width) == 1) {
++        ff_hevc_save_states_wpp(lc, ctb_addr_ts + 1);
++    }
++
++    return more_data;
++}
++
+ static int hls_decode_entry(HEVCContext *s, GetBitContext *gb)
+ {
+     HEVCLocalContext *const lc = &s->local_ctx[0];
+@@ -3070,6 +3132,13 @@ static int decode_slice_data(HEVCContext *s, const HEVCLayerContext *l,
+     s->local_ctx[0].tu.cu_qp_offset_cb = 0;
+     s->local_ctx[0].tu.cu_qp_offset_cr = 0;
+ 
++    // CTU-level WPP 并行路径 (使用 executor)
++    if (s->executor && pps->entropy_coding_sync_enabled_flag &&
++        s->wpp_type != 1 /* 非 legacy 模式 */) {
++        return ff_hevc_frame_submit(s, (HEVCLayerContext *)l);
++    }
++
++    // Legacy WPP 路径 (使用 SliceContext 线程)
+     if (s->avctx->active_thread_type == FF_THREAD_SLICE  &&
+         s->sh.num_entry_point_offsets > 0                &&
+         pps->num_tile_rows == 1 && pps->num_tile_columns == 1)
+@@ -3926,6 +3995,9 @@ static av_cold int hevc_decode_free(AVCodecContext *avctx)
+ {
+     HEVCContext       *s = avctx->priv_data;
+ 
++    // 释放 CTU-level WPP executor
++    ff_hevc_executor_free(&s->executor);
++
+     for (int i = 0; i < FF_ARRAY_ELEMS(s->layers); i++) {
+         pic_arrays_free(&s->layers[i]);
+         av_refstruct_unref(&s->layers[i].sps);
+@@ -4167,6 +4239,17 @@ static av_cold int hevc_decode_init(AVCodecContext *avctx)
+ 
+     atomic_init(&s->wpp_err, 0);
+ 
++    // 创建 CTU-level WPP executor (仅当显式请求 wpp_type=2)
++    // 注意: CTU-level WPP 功能尚未完全实现，默认禁用
++    if (s->wpp_type == 2 && avctx->thread_count > 1) {
++        s->executor = ff_hevc_executor_alloc(s, avctx->thread_count);
++        if (!s->executor) {
++            av_log(avctx, AV_LOG_WARNING,
++                   "Failed to create CTU-level WPP executor, falling back to legacy WPP\n");
++            // 继续使用 legacy WPP，不返回错误
++        }
++    }
++
+     if (!avctx->internal->is_copy) {
+         const AVPacketSideData *sd;
+ 
+@@ -4210,6 +4293,8 @@ static const AVOption options[] = {
+         AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
+     { "strict-displaywin", "strictly apply default display window size", OFFSET(apply_defdispwin),
+         AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
++    { "wpp_type", "WPP parallel decoding mode (0=auto, 1=legacy row-level, 2=CTU-level)", OFFSET(wpp_type),
++        AV_OPT_TYPE_INT, {.i64 = 0}, 0, 2, PAR },
+     { "view_ids", "Array of view IDs that should be decoded and output; a single -1 to decode all views",
+         .offset = OFFSET(view_ids), .type = AV_OPT_TYPE_INT | AV_OPT_TYPE_FLAG_ARRAY,
+         .min = -1, .max = INT_MAX, .flags = PAR },
+diff --git a/libavcodec/hevc/hevcdec.h b/libavcodec/hevc/hevcdec.h
+index 8394740c4b..c735991bf8 100644
+--- a/libavcodec/hevc/hevcdec.h
++++ b/libavcodec/hevc/hevcdec.h
+@@ -42,6 +42,10 @@
+ #include "ps.h"
+ #include "sei.h"
+ 
++// 前向声明
++struct FFExecutor;
++struct HEVCFrameThread;
++
+ #define SHIFT_CTB_WPP 2
+ 
+ #define MAX_TB_SIZE 32
+@@ -386,6 +390,11 @@ typedef struct HEVCFrame {
+      * A combination of HEVC_FRAME_FLAG_*
+      */
+     uint8_t flags;
++
++    /**
++     * Frame thread context for CTU-level WPP parallel decoding.
++     */
++    struct HEVCFrameThread *ft;
+ } HEVCFrame;
+ 
+ typedef struct HEVCLocalContext {
+@@ -581,6 +590,10 @@ typedef struct HEVCContext {
+ 
+     AVBufferRef *rpu_buf;       ///< 0 or 1 Dolby Vision RPUs.
+     DOVIContext dovi_ctx;       ///< Dolby Vision decoding context
++
++    // CTU-level WPP parallel decoding support
++    struct FFExecutor *executor;  ///< task executor for CTU-level WPP
++    int wpp_type;                 ///< 0=auto, 1=legacy, 2=ctu-level
+ } HEVCContext;
+ 
+ /**
+@@ -607,6 +620,10 @@ int ff_hevc_slice_rpl(HEVCContext *s);
+ 
+ void ff_hevc_save_states(HEVCLocalContext *lc, const HEVCPPS *pps,
+                          int ctb_addr_ts);
++// WPP CABAC 状态保存/恢复 (CTU(1, y) 后保存，CTU(0, y+1) 前恢复)
++void ff_hevc_save_states_wpp(HEVCLocalContext *lc, int ctb_addr_ts);
++void ff_hevc_load_states_wpp(HEVCLocalContext *lc, const HEVCCABACState *src,
++                             const HEVCSPS *sps);
+ int ff_hevc_cabac_init(HEVCLocalContext *lc, const HEVCPPS *pps,
+                        int ctb_addr_ts, const uint8_t *data, size_t size,
+                        int is_wpp);
+@@ -700,6 +717,28 @@ void ff_hevc_hls_filter(HEVCLocalContext *lc, const HEVCLayerContext *l,
+ void ff_hevc_hls_filters(HEVCLocalContext *lc, const HEVCLayerContext *l,
+                          const HEVCPPS *pps,
+                          int x_ctb, int y_ctb, int ctb_size);
++// 拆分后的滤波阶段函数 (用于 CTU 级 WPP)
++void ff_hevc_deblock_filter_ctb(HEVCLocalContext *lc, const HEVCLayerContext *l,
++                                const HEVCPPS *pps, int x, int y, int ctb_size,
++                                int vertical);
++void ff_hevc_sao_filter_ctb(HEVCLocalContext *lc, const HEVCLayerContext *l,
++                            const HEVCPPS *pps, int x, int y, int ctb_size);
++
++/**
++ * 解码单个 CTU (用于 CTU 级 WPP 并行)
++ *
++ * @param lc 本地上下文
++ * @param l layer 上下文
++ * @param ctb_addr_rs CTU 光栅扫描地址
++ * @param data slice 数据指针
++ * @param size slice 数据大小
++ * @param is_first_in_row 是否为行首 CTU
++ * @return 0 成功, 1 还有更多数据, <0 错误
++ */
++int ff_hevc_decode_ctu(HEVCLocalContext *lc, HEVCLayerContext *l,
++                       int ctb_addr_rs, const uint8_t *data, size_t size,
++                       int is_first_in_row);
++
+ void ff_hevc_set_qPy(HEVCLocalContext *lc,
+                      const HEVCLayerContext *l, const HEVCPPS *pps,
+                      int xBase, int yBase, int log2_cb_size);
+diff --git a/libavcodec/hevc/refs.c b/libavcodec/hevc/refs.c
+index ccf7258ec4..bbb3e38bb8 100644
+--- a/libavcodec/hevc/refs.c
++++ b/libavcodec/hevc/refs.c
+@@ -29,7 +29,7 @@
+ #include "hevc.h"
+ #include "hevcdec.h"
+ #include "progressframe.h"
+-#include "thread.h"
++#include "../thread.h"
+ #include "libavutil/refstruct.h"
+ 
+ void ff_hevc_unref_frame(HEVCFrame *frame, int flags)
+diff --git a/libavcodec/hevc/thread.c b/libavcodec/hevc/thread.c
+new file mode 100644
+index 0000000000..dd921b956f
+--- /dev/null
++++ b/libavcodec/hevc/thread.c
+@@ -0,0 +1,826 @@
++/*
++ * HEVC WPP thread logic
++ *
++ * Copyright (C) 2024 FFmpeg Project
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <stdatomic.h>
++
++#include "libavcodec/executor.h"
++#include "libavutil/mem.h"
++#include "libavutil/thread.h"
++
++#include "thread.h"
++#include "hevcdec.h"
++
++// 任务优先级: 0 最高, 2 最低
++#define PRIORITY_LOWEST 2
++
++// 各阶段需要的目标分数 (score 达到此值时可调度)
++// 对应 HEVCTaskStage 枚举顺序
++static const uint8_t target_score[] = {
++    2,  // HEVC_TASK_STAGE_PARSE:     left + (wpp ? above_right : 1)
++    0,  // HEVC_TASK_STAGE_INTER:     动态计算 (参考帧数量)
++    2,  // HEVC_TASK_STAGE_RECON:     left + top
++    1,  // HEVC_TASK_STAGE_DEBLOCK_V: left
++    2,  // HEVC_TASK_STAGE_DEBLOCK_H: left_v + top_h
++    5,  // HEVC_TASK_STAGE_SAO:       5 个邻居
++};
++
++// 各阶段任务优先级
++static const int task_priorities[] = {
++    0,              // HEVC_TASK_STAGE_PARSE     - 最高优先级
++    PRIORITY_LOWEST,// HEVC_TASK_STAGE_INTER     - 最低优先级 (避免 inter 任务堆积)
++    1,              // HEVC_TASK_STAGE_RECON
++    1,              // HEVC_TASK_STAGE_DEBLOCK_V
++    1,              // HEVC_TASK_STAGE_DEBLOCK_H
++    1,              // HEVC_TASK_STAGE_SAO
++};
++
++// 阶段名称 (用于调试)
++static const char* task_name[] = {
++    "P",    // PARSE
++    "I",    // INTER
++    "R",    // RECON
++    "V",    // DEBLOCK_V
++    "H",    // DEBLOCK_H
++    "S",    // SAO
++};
++
++// ============================================================================
++// 内部函数声明
++// ============================================================================
++
++static void add_task(HEVCContext *s, HEVCTask *t);
++static void frame_thread_add_score(HEVCContext *s, HEVCFrameThread *ft,
++                                    int rx, int ry, HEVCTaskStage stage);
++static int task_has_target_score(HEVCTask *t, HEVCTaskStage stage, uint8_t score);
++static void task_stage_done(const HEVCTask *t, HEVCContext *s);
++static int task_run(FFTask *_t, void *local_context, void *user_data);
++
++// ============================================================================
++// 任务初始化
++// ============================================================================
++
++/**
++ * 初始化单个 CTU 任务
++ */
++static void task_init(HEVCTask *t, HEVCTaskStage stage, HEVCLayerContext *l,
++                       HEVCFrame *frame, HEVCFrameThread *ft,
++                       int rx, int ry)
++{
++    memset(t, 0, sizeof(*t));
++    t->stage = stage;
++    t->l = l;
++    t->frame = frame;
++    t->rx = rx;
++    t->ry = ry;
++    t->rs = ry * ft->ctu_width + rx;
++
++    for (int i = 0; i < FF_ARRAY_ELEMS(t->score); i++)
++        atomic_store(&t->score[i], 0);
++    atomic_store(&t->target_inter_score, 0);
++}
++
++/**
++ * 初始化 PARSE 阶段参数
++ */
++static int task_init_parse(HEVCTask *t, SliceHeader *sh, int ctu_idx,
++                            const uint8_t *slice_data, size_t slice_size)
++{
++    if (t->sh) {
++        // 任务已初始化，码流错误
++        return AVERROR_INVALIDDATA;
++    }
++    t->sh = sh;
++    t->ctu_idx = ctu_idx;
++    t->slice_data = slice_data;
++    t->slice_size = slice_size;
++    return 0;
++}
++
++/**
++ * 增加任务分数
++ */
++static uint8_t task_add_score(HEVCTask *t, HEVCTaskStage stage)
++{
++    return atomic_fetch_add(&t->score[stage], 1) + 1;
++}
++
++/**
++ * 获取任务分数
++ */
++static uint8_t task_get_score(HEVCTask *t, HEVCTaskStage stage)
++{
++    return atomic_load(&t->score[stage]);
++}
++
++// ============================================================================
++// 分数管理和依赖检查
++// ============================================================================
++
++/**
++ * 检查任务是否达到目标分数，可以调度执行
++ *
++ * 对于 PARSE 阶段:
++ *   - 需要左邻 CTU 的 PARSE 完成
++ *   - WPP 模式下还需要上一行第二个 CTU 的 PARSE 完成 (CABAC 状态传递)
++ *
++ * 对于 INTER 阶段:
++ *   - 需要等待所有参考帧的对应位置像素就绪
++ *   - 目标分数动态计算
++ *
++ * 对于其他阶段:
++ *   - 使用静态 target_score 表
++ */
++static int task_has_target_score(HEVCTask *t, HEVCTaskStage stage, uint8_t score)
++{
++    uint8_t target = 0;
++
++    if (stage == HEVC_TASK_STAGE_PARSE) {
++        // PARSE 阶段: 需要左邻和 WPP 依赖
++        // 第一个 CTU 只需要等待 WPP 状态 (如果不是第一行)
++        // 其他 CTU 需要等待左邻 + WPP
++        int is_first_in_row = (t->rx == 0);
++        int is_first_row = (t->ry == 0);
++
++        if (is_first_in_row && is_first_row) {
++            target = 0;  // CTU(0,0) 无依赖
++        } else if (is_first_in_row) {
++            target = 1;  // 行首 CTU 只等待 WPP 状态
++        } else if (is_first_row) {
++            target = 1;  // 第一行只等待左邻
++        } else {
++            target = 2;  // 需要左邻 + WPP
++        }
++    } else if (stage == HEVC_TASK_STAGE_INTER) {
++        // INTER 阶段: 动态目标分数 (取决于参考帧数量)
++        target = atomic_load(&t->target_inter_score);
++    } else {
++        target = target_score[stage];
++    }
++
++    // +1 是因为上一阶段完成时会加 1
++    av_assert0(score <= target + 1);
++    return score == target + 1;
++}
++
++/**
++ * 检查任务是否可以继续执行下一阶段
++ */
++static int task_is_stage_ready(HEVCTask *t, int add)
++{
++    HEVCTaskStage stage = t->stage;
++    uint8_t score;
++
++    if (stage >= HEVC_TASK_STAGE_LAST)
++        return 0;
++
++    score = task_get_score(t, stage) + add;
++    return task_has_target_score(t, stage, score);
++}
++
++/**
++ * 向指定 CTU 任务添加分数
++ * 如果分数达到目标，则将任务加入执行队列
++ */
++static void frame_thread_add_score(HEVCContext *s, HEVCFrameThread *ft,
++                                    int rx, int ry, HEVCTaskStage stage)
++{
++    HEVCTask *t;
++    uint8_t score;
++
++    // 边界检查
++    if (rx < 0 || rx >= ft->ctu_width || ry < 0 || ry >= ft->ctu_height)
++        return;
++
++    t = ft->tasks + ft->ctu_width * ry + rx;
++    score = task_add_score(t, stage);
++
++    if (task_has_target_score(t, stage, score)) {
++        av_assert0(s);
++        av_assert0(stage == t->stage);
++        add_task(s, t);
++    }
++}
++
++// ============================================================================
++// 任务调度
++// ============================================================================
++
++/**
++ * 任务调度计数完成回调
++ */
++static void scheduled_done(HEVCFrameThread *ft, atomic_int *scheduled)
++{
++    if (atomic_fetch_sub(scheduled, 1) == 1) {
++        ff_mutex_lock(&ft->lock);
++        ff_cond_signal(&ft->cond);
++        ff_mutex_unlock(&ft->lock);
++    }
++}
++
++/**
++ * 将任务添加到 executor 队列
++ */
++static void add_task(HEVCContext *s, HEVCTask *t)
++{
++    HEVCFrameThread *ft = t->frame->ft;
++    FFTask *task = &t->u.task;
++
++    atomic_fetch_add(&ft->nb_scheduled_tasks, 1);
++    task->priority = task_priorities[t->stage];
++    ff_executor_execute(s->executor, task);
++}
++
++// ============================================================================
++// 阶段完成后的分数更新
++// ============================================================================
++
++/**
++ * 任务阶段完成后，更新邻居 CTU 的分数
++ */
++static void task_stage_done(const HEVCTask *t, HEVCContext *s)
++{
++    HEVCFrameThread *ft = t->frame->ft;
++    HEVCTaskStage stage = t->stage;
++
++#define ADD(dx, dy, next_stage) \
++    frame_thread_add_score(s, ft, t->rx + (dx), t->ry + (dy), next_stage)
++
++    switch (stage) {
++    case HEVC_TASK_STAGE_PARSE:
++        // PARSE 完成后:
++        // - 右邻可以开始 PARSE (左依赖满足)
++        // - 下一行当前列可以开始 PARSE (WPP)
++        // - 下一行左邻可以开始 PARSE (WPP)
++        ADD(1, 0, HEVC_TASK_STAGE_PARSE);   // 右邻
++        if (t->rx >= 1) {
++            // WPP: 下一行的 CTU 可以开始
++            ADD(0, 1, HEVC_TASK_STAGE_PARSE);   // 下方
++            ADD(-1, 1, HEVC_TASK_STAGE_PARSE);  // 下方左邻
++        }
++        break;
++
++    case HEVC_TASK_STAGE_INTER:
++        // INTER 完成后，当前 CTU 可以进入 RECON
++        // 分数已在 task_run 中通过阶段推进处理
++        break;
++
++    case HEVC_TASK_STAGE_RECON:
++        // RECON 完成后:
++        // - 右邻可以开始 RECON
++        // - 下方可以开始 RECON
++        ADD(1, 0, HEVC_TASK_STAGE_RECON);   // 右邻
++        ADD(0, 1, HEVC_TASK_STAGE_RECON);   // 下方
++        break;
++
++    case HEVC_TASK_STAGE_DEBLOCK_V:
++        // DEBLOCK_V 完成后:
++        // - 右邻可以开始 DEBLOCK_V
++        // - 当前 CTU 可以开始 DEBLOCK_H (需要右邻 DEBLOCK_V)
++        ADD(1, 0, HEVC_TASK_STAGE_DEBLOCK_V);
++        ADD(0, 0, HEVC_TASK_STAGE_DEBLOCK_H);  // 当前 CTU 的 H 依赖
++        break;
++
++    case HEVC_TASK_STAGE_DEBLOCK_H:
++        // DEBLOCK_H 完成后:
++        // - 下方可以开始 DEBLOCK_H
++        // - 更新 SAO 依赖 (需要周围 5 个 CTU)
++        ADD(0, 1, HEVC_TASK_STAGE_DEBLOCK_H);
++        // SAO 依赖: LT, T, RT, L, LB
++        ADD(-1, -1, HEVC_TASK_STAGE_SAO);
++        ADD(0, -1, HEVC_TASK_STAGE_SAO);
++        ADD(1, -1, HEVC_TASK_STAGE_SAO);
++        ADD(-1, 0, HEVC_TASK_STAGE_SAO);
++        ADD(-1, 1, HEVC_TASK_STAGE_SAO);
++        break;
++
++    case HEVC_TASK_STAGE_SAO:
++        // SAO 完成，任务结束
++        break;
++
++    default:
++        break;
++    }
++
++#undef ADD
++}
++
++// ============================================================================
++// 帧间进度报告
++// ============================================================================
++
++/**
++ * 进度监听器完成回调
++ */
++static void progress_done_pixel(HEVCProgressListener *l)
++{
++    HEVCTask *t = l->task;
++    HEVCFrameThread *ft = t->frame->ft;
++
++    frame_thread_add_score(l->s, ft, t->rx, t->ry, HEVC_TASK_STAGE_INTER);
++    scheduled_done(ft, &ft->nb_scheduled_listeners);
++}
++
++static void progress_done_mv(HEVCProgressListener *l)
++{
++    HEVCTask *t = l->task;
++    HEVCFrameThread *ft = t->frame->ft;
++
++    frame_thread_add_score(l->s, ft, t->rx, t->ry, HEVC_TASK_STAGE_PARSE);
++    scheduled_done(ft, &ft->nb_scheduled_listeners);
++}
++
++/**
++ * 初始化进度监听器
++ */
++static void listener_init(HEVCProgressListener *l, HEVCTask *t,
++                           HEVCContext *s, HEVCProgress vp, int y)
++{
++    int is_pixel = (vp == HEVC_PROGRESS_PIXEL);
++
++    l->task = t;
++    l->s = s;
++    l->vp = vp;
++    l->y = y;
++    l->progress_done = is_pixel ? progress_done_pixel : progress_done_mv;
++
++    if (is_pixel)
++        atomic_fetch_add(&t->target_inter_score, 1);
++}
++
++/**
++ * 添加进度监听器到参考帧
++ */
++static void add_progress_listener_internal(HEVCFrame *ref, HEVCProgressListener *l,
++                                            HEVCTask *t, HEVCContext *s,
++                                            HEVCProgress vp, int y)
++{
++    HEVCFrameThread *ft = t->frame->ft;
++
++    atomic_fetch_add(&ft->nb_scheduled_listeners, 1);
++    listener_init(l, t, s, vp, y);
++    ff_hevc_add_progress_listener(ref, l);
++}
++
++/**
++ * 报告帧进度
++ */
++static void report_frame_progress(HEVCFrame *frame, int ry, HEVCProgress idx)
++{
++    HEVCFrameThread *ft = frame->ft;
++    int ctu_size = ft->ctu_size;
++
++    if (atomic_fetch_add(&ft->rows[ry].col_progress[idx], 1) == ft->ctu_width - 1) {
++        int y, old;
++
++        ff_mutex_lock(&ft->lock);
++        y = old = ft->row_progress[idx];
++        while (y < ft->ctu_height &&
++               atomic_load(&ft->rows[y].col_progress[idx]) == ft->ctu_width)
++            y++;
++        if (old != y)
++            ft->row_progress[idx] = y;
++        ff_mutex_unlock(&ft->lock);
++
++        if (old != y) {
++            int progress = (y == ft->ctu_height) ? INT_MAX : y * ctu_size;
++            ff_hevc_report_progress(frame, idx, progress);
++        }
++    }
++}
++
++// ============================================================================
++// 各阶段运行函数
++// ============================================================================
++
++/**
++ * PARSE 阶段: 熵解码 + CABAC
++ * 调用 ff_hevc_decode_ctu 进行 CTU 解析
++ */
++static int run_parse(HEVCContext *s, HEVCLocalContext *lc, HEVCTask *t)
++{
++    HEVCLayerContext *l = t->l;
++    const HEVCPPS *pps = s->pps;
++    int ctb_addr_rs = t->rs;
++    int is_first_in_row = (t->rx == 0);
++    int ret;
++
++    // WPP: 行首 CTU 需要恢复上一行保存的 CABAC 状态
++    if (pps->entropy_coding_sync_enabled_flag && is_first_in_row && t->ry > 0) {
++        ff_hevc_load_states_wpp(lc, lc->common_cabac_state, pps->sps);
++    }
++
++    // 调用 CTU 解码
++    ret = ff_hevc_decode_ctu(lc, l, ctb_addr_rs,
++                              t->slice_data, t->slice_size,
++                              is_first_in_row);
++    if (ret < 0)
++        return ret;
++
++    // WPP CABAC 状态保存已在 ff_hevc_decode_ctu 内部处理 (CTU(1,y) 后)
++
++    return 0;
++}
++
++/**
++ * INTER 阶段: 帧间预测
++ */
++static int run_inter(HEVCContext *s, HEVCLocalContext *lc, HEVCTask *t)
++{
++    // TODO: 帧间预测实现
++    // 需要等待参考帧像素就绪后执行
++
++    return 0;
++}
++
++/**
++ * RECON 阶段: 重建 (帧内预测 + 残差)
++ */
++static int run_recon(HEVCContext *s, HEVCLocalContext *lc, HEVCTask *t)
++{
++    // TODO: 重建实现
++
++    // 报告 MV 进度 (如果没有 DMVR)
++    // report_frame_progress(t->frame, t->ry, HEVC_PROGRESS_MV);
++
++    return 0;
++}
++
++/**
++ * DEBLOCK_V 阶段: 垂直去块效应滤波
++ */
++static int run_deblock_v(HEVCContext *s, HEVCLocalContext *lc, HEVCTask *t)
++{
++    HEVCLayerContext *l = t->l;
++    HEVCFrameThread *ft = t->frame->ft;
++    const HEVCPPS *pps = s->pps;
++    int ctb_size = ft->ctu_size;
++    int x0 = t->rx * ctb_size;
++    int y0 = t->ry * ctb_size;
++
++    // 调用垂直去块效应滤波
++    // 注意: 当前实现是垂直+水平混合，后续需要拆分
++    ff_hevc_deblock_filter_ctb(lc, l, pps, x0, y0, ctb_size, 1);
++
++    return 0;
++}
++
++/**
++ * DEBLOCK_H 阶段: 水平去块效应滤波
++ * 注意: 由于当前 deblocking_filter_CTB 是垂直+水平混合的，
++ * DEBLOCK_H 暂时为空操作。后续需要拆分滤波函数。
++ */
++static int run_deblock_h(HEVCContext *s, HEVCLocalContext *lc, HEVCTask *t)
++{
++    // 当前实现中，垂直和水平滤波在 run_deblock_v 中一起完成
++    // 此阶段仅用于依赖管理和进度报告
++    (void)s;
++    (void)lc;
++    (void)t;
++
++    return 0;
++}
++
++/**
++ * SAO 阶段: SAO 滤波
++ */
++static int run_sao(HEVCContext *s, HEVCLocalContext *lc, HEVCTask *t)
++{
++    HEVCLayerContext *l = t->l;
++    HEVCFrameThread *ft = t->frame->ft;
++    const HEVCPPS *pps = s->pps;
++    int ctb_size = ft->ctu_size;
++    int x0 = t->rx * ctb_size;
++    int y0 = t->ry * ctb_size;
++
++    // 调用 SAO 滤波
++    ff_hevc_sao_filter_ctb(lc, l, pps, x0, y0, ctb_size);
++
++    // 报告像素进度
++    report_frame_progress(t->frame, t->ry, HEVC_PROGRESS_PIXEL);
++
++    return 0;
++}
++
++// ============================================================================
++// 任务执行主循环
++// ============================================================================
++
++typedef int (*run_func)(HEVCContext *s, HEVCLocalContext *lc, HEVCTask *t);
++
++/**
++ * 执行任务的单个阶段
++ */
++static void task_run_stage(HEVCTask *t, HEVCContext *s, HEVCLocalContext *lc)
++{
++    HEVCFrameThread *ft = t->frame->ft;
++    HEVCTaskStage stage = t->stage;
++    int ret;
++
++    static const run_func run[] = {
++        run_parse,
++        run_inter,
++        run_recon,
++        run_deblock_v,
++        run_deblock_h,
++        run_sao,
++    };
++
++    av_log(s->avctx, AV_LOG_DEBUG, "frame %d, %s(%d, %d)\n",
++           t->frame->poc, task_name[stage], t->rx, t->ry);
++
++    if (!atomic_load(&ft->ret)) {
++        if ((ret = run[stage](s, lc, t)) < 0) {
++#ifdef COMPAT_ATOMICS_WIN32_STDATOMIC_H
++            intptr_t zero = 0;
++#else
++            int zero = 0;
++#endif
++            atomic_compare_exchange_strong(&ft->ret, &zero, ret);
++            av_log(s->avctx, AV_LOG_ERROR,
++                   "frame %d, %s(%d, %d) failed with %d\n",
++                   t->frame->poc, task_name[stage], t->rx, t->ry, ret);
++        }
++        if (!ret)
++            task_stage_done(t, s);
++    }
++}
++
++/**
++ * 任务执行入口 (由 executor 调用)
++ */
++static int task_run(FFTask *_t, void *local_context, void *user_data)
++{
++    HEVCTask *t = (HEVCTask *)_t;
++    HEVCContext *s = (HEVCContext *)user_data;
++    HEVCLocalContext *lc = local_context;
++    HEVCFrameThread *ft = t->frame->ft;
++
++    lc->parent = s;
++
++    do {
++        task_run_stage(t, s, lc);
++        t->stage++;
++    } while (task_is_stage_ready(t, 1));
++
++    if (t->stage != HEVC_TASK_STAGE_LAST)
++        frame_thread_add_score(s, ft, t->rx, t->ry, t->stage);
++
++    scheduled_done(ft, &ft->nb_scheduled_tasks);
++
++    return 0;
++}
++
++// ============================================================================
++// 边界分数初始化
++// ============================================================================
++
++/**
++ * 初始化边界 CTU 的分数
++ * 边界外的虚拟 CTU 被认为已完成所有阶段
++ */
++static void frame_thread_init_score(HEVCLayerContext *l, HEVCFrame *frame)
++{
++    HEVCFrameThread *ft = frame->ft;
++    HEVCTask task;
++
++    task_init(&task, HEVC_TASK_STAGE_PARSE, l, frame, ft, 0, 0);
++
++    for (int i = HEVC_TASK_STAGE_PARSE; i < HEVC_TASK_STAGE_LAST; i++) {
++        task.stage = i;
++
++        // 上下边界
++        for (task.rx = -1; task.rx <= ft->ctu_width; task.rx++) {
++            task.ry = -1;               // 顶部
++            task_stage_done(&task, NULL);
++            task.ry = ft->ctu_height;   // 底部
++            task_stage_done(&task, NULL);
++        }
++
++        // 左右边界
++        for (task.ry = 0; task.ry < ft->ctu_height; task.ry++) {
++            task.rx = -1;               // 左边
++            task_stage_done(&task, NULL);
++            task.rx = ft->ctu_width;    // 右边
++            task_stage_done(&task, NULL);
++        }
++    }
++}
++
++// ============================================================================
++// 公共 API 实现
++// ============================================================================
++
++/**
++ * 创建 executor
++ */
++FFExecutor* ff_hevc_executor_alloc(HEVCContext *s, int thread_count)
++{
++    FFTaskCallbacks callbacks = {
++        s,
++        sizeof(HEVCLocalContext),
++        PRIORITY_LOWEST + 1,
++        task_run,
++    };
++    return ff_executor_alloc(&callbacks, thread_count);
++}
++
++/**
++ * 释放 executor
++ */
++void ff_hevc_executor_free(FFExecutor **e)
++{
++    ff_executor_free(e);
++}
++
++/**
++ * 初始化帧线程上下文
++ */
++int ff_hevc_frame_thread_init(HEVCLayerContext *l, HEVCFrame *f,
++                               int ctu_width, int ctu_height, int ctu_size)
++{
++    HEVCFrameThread *ft = f->ft;
++    int ret;
++
++    // 检查是否需要重新分配
++    if (!ft || ft->ctu_width != ctu_width ||
++        ft->ctu_height != ctu_height || ft->ctu_size != ctu_size) {
++
++        ff_hevc_frame_thread_free(f);
++
++        ft = av_calloc(1, sizeof(*ft));
++        if (!ft)
++            return AVERROR(ENOMEM);
++
++        ft->ctu_width = ctu_width;
++        ft->ctu_height = ctu_height;
++        ft->ctu_count = ctu_width * ctu_height;
++        ft->ctu_size = ctu_size;
++
++        ft->rows = av_calloc(ctu_height, sizeof(*ft->rows));
++        if (!ft->rows)
++            goto fail;
++
++        ft->tasks = av_malloc_array(ft->ctu_count, sizeof(*ft->tasks));
++        if (!ft->tasks)
++            goto fail;
++
++        if ((ret = ff_cond_init(&ft->cond, NULL)))
++            goto fail;
++
++        if ((ret = ff_mutex_init(&ft->lock, NULL))) {
++            ff_cond_destroy(&ft->cond);
++            goto fail;
++        }
++    }
++
++    f->ft = ft;
++    atomic_store(&ft->ret, 0);
++
++    // 重置行进度
++    for (int y = 0; y < ft->ctu_height; y++) {
++        HEVCRowThread *row = ft->rows + y;
++        memset(row->col_progress, 0, sizeof(row->col_progress));
++    }
++
++    // 初始化所有 CTU 任务
++    for (int rs = 0; rs < ft->ctu_count; rs++) {
++        HEVCTask *t = ft->tasks + rs;
++        int rx = rs % ft->ctu_width;
++        int ry = rs / ft->ctu_width;
++        task_init(t, HEVC_TASK_STAGE_PARSE, l, f, ft, rx, ry);
++    }
++
++    memset(ft->row_progress, 0, sizeof(ft->row_progress));
++
++    // 初始化边界分数
++    frame_thread_init_score(l, f);
++
++    return 0;
++
++fail:
++    if (ft) {
++        av_freep(&ft->rows);
++        av_freep(&ft->tasks);
++        av_freep(&ft);
++    }
++    return AVERROR(ENOMEM);
++}
++
++/**
++ * 释放帧线程上下文
++ */
++void ff_hevc_frame_thread_free(HEVCFrame *f)
++{
++    HEVCFrameThread *ft = f->ft;
++
++    if (!ft)
++        return;
++
++    ff_mutex_destroy(&ft->lock);
++    ff_cond_destroy(&ft->cond);
++    av_freep(&ft->rows);
++    av_freep(&ft->tasks);
++    av_freep(&ft);
++    f->ft = NULL;
++}
++
++/**
++ * 提交帧进行解码
++ */
++int ff_hevc_frame_submit(HEVCContext *s, HEVCLayerContext *l)
++{
++    HEVCFrame *f = l->cur_frame;
++    HEVCFrameThread *ft = f->ft;
++    SliceHeader *sh = &s->sh;
++    const uint8_t *slice_data = s->data + sh->data_offset;
++    // 注意: 这里简化处理，实际应该根据每个 slice 获取正确的数据范围
++    size_t slice_size = 0;  // TODO: 需要从 slice header 获取正确的大小
++
++    // 为每个 CTU 初始化 PARSE 参数
++    // TODO: 需要遍历所有 slice 的 CTU，每个 slice 有不同的 data/size
++    for (int rs = 0; rs < ft->ctu_count; rs++) {
++        HEVCTask *t = ft->tasks + rs;
++        int ret = task_init_parse(t, sh, rs, slice_data, slice_size);
++        if (ret < 0)
++            return ret;
++    }
++
++    // 验证所有 CTU 都属于某个 slice
++    for (int rs = 0; rs < ft->ctu_count; rs++) {
++        const HEVCTask *t = ft->tasks + rs;
++        if (!t->sh) {
++            av_log(s->avctx, AV_LOG_ERROR,
++                   "frame %d, CTU(%d, %d) not belong to any slice\n",
++                   f->poc, t->rx, t->ry);
++            return AVERROR_INVALIDDATA;
++        }
++    }
++
++    // 启动第一个 CTU
++    frame_thread_add_score(s, ft, 0, 0, HEVC_TASK_STAGE_PARSE);
++
++    return 0;
++}
++
++/**
++ * 等待帧解码完成
++ */
++int ff_hevc_frame_wait(HEVCContext *s, HEVCLayerContext *l)
++{
++    HEVCFrame *f = l->cur_frame;
++    HEVCFrameThread *ft = f->ft;
++
++    ff_mutex_lock(&ft->lock);
++
++    while (atomic_load(&ft->nb_scheduled_tasks) ||
++           atomic_load(&ft->nb_scheduled_listeners))
++        ff_cond_wait(&ft->cond, &ft->lock);
++
++    ff_mutex_unlock(&ft->lock);
++
++    av_log(s->avctx, AV_LOG_DEBUG, "frame %d done\n", f->poc);
++
++    return atomic_load(&ft->ret);
++}
++
++/**
++ * 报告帧进度 (供外部调用)
++ */
++void ff_hevc_report_progress(HEVCFrame *f, HEVCProgress idx, int y)
++{
++    // TODO: 实现帧间进度报告
++    // 需要唤醒等待此帧的任务
++    (void)f;
++    (void)idx;
++    (void)y;
++}
++
++/**
++ * 添加进度监听器 (供外部调用)
++ */
++void ff_hevc_add_progress_listener(HEVCFrame *ref, HEVCProgressListener *l)
++{
++    // TODO: 实现监听器添加
++    // 如果进度已满足，直接调用回调
++    (void)ref;
++    (void)l;
++}
+diff --git a/libavcodec/hevc/thread.h b/libavcodec/hevc/thread.h
+new file mode 100644
+index 0000000000..dc62eda35b
+--- /dev/null
++++ b/libavcodec/hevc/thread.h
+@@ -0,0 +1,154 @@
++/*
++ * HEVC WPP thread logic
++ *
++ * Copyright (C) 2024 FFmpeg Project
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVCODEC_HEVC_THREAD_H
++#define AVCODEC_HEVC_THREAD_H
++
++#include <stdatomic.h>
++
++#include "libavcodec/executor.h"
++#include "libavutil/thread.h"
++#include "hevc.h"
++
++struct HEVCContext;
++struct HEVCLayerContext;
++struct HEVCFrame;
++
++/**
++ * Task processing stages for CTU-level parallelism.
++ * Tasks progress through these stages sequentially.
++ */
++typedef enum HEVCTaskStage {
++    HEVC_TASK_STAGE_PARSE,       // 熵解码 + CABAC
++    HEVC_TASK_STAGE_INTER,       // 帧间预测 (等待参考帧)
++    HEVC_TASK_STAGE_RECON,       // 重建 (帧内预测 + 残差)
++    HEVC_TASK_STAGE_DEBLOCK_V,   // 垂直 Deblocking
++    HEVC_TASK_STAGE_DEBLOCK_H,   // 水平 Deblocking
++    HEVC_TASK_STAGE_SAO,         // SAO 滤波
++    HEVC_TASK_STAGE_LAST
++} HEVCTaskStage;
++
++/**
++ * Progress types for inter-frame dependencies.
++ */
++typedef enum HEVCProgress {
++    HEVC_PROGRESS_MV,      // 运动向量就绪
++    HEVC_PROGRESS_PIXEL,   // 像素就绪
++    HEVC_PROGRESS_LAST
++} HEVCProgress;
++
++/**
++ * Progress listener for inter-frame dependencies.
++ * Used when a task needs to wait for a reference frame's progress.
++ */
++typedef struct HEVCProgressListener {
++    struct HEVCProgressListener *next;
++    struct HEVCTask *task;
++    struct HEVCContext *s;
++    HEVCProgress vp;         // 等待的进度类型
++    int y;                   // 等待的 y 坐标
++    void (*progress_done)(struct HEVCProgressListener *l);
++} HEVCProgressListener;
++
++/**
++ * Per-row thread state for progress tracking.
++ */
++typedef struct HEVCRowThread {
++    atomic_int col_progress[HEVC_PROGRESS_LAST];  // 各阶段列进度
++} HEVCRowThread;
++
++/**
++ * Per-frame thread context.
++ * Manages CTU tasks and synchronization for a single frame.
++ */
++typedef struct HEVCFrameThread {
++    atomic_int ret;                     // 错误返回值
++
++    HEVCRowThread *rows;                // 行状态数组
++    struct HEVCTask *tasks;             // CTU 任务数组
++
++    int ctu_size;                       // CTU 大小
++    int ctu_width;                      // CTU 列数
++    int ctu_height;                     // CTU 行数
++    int ctu_count;                      // CTU 总数
++
++    // 调度状态
++    atomic_int nb_scheduled_tasks;
++    atomic_int nb_scheduled_listeners;
++
++    // 行进度 (用于帧间进度报告)
++    int row_progress[HEVC_PROGRESS_LAST];
++
++    AVMutex lock;
++    AVCond cond;
++} HEVCFrameThread;
++
++/**
++ * CTU-level task.
++ * Each CTU has one task that progresses through all stages.
++ */
++typedef struct HEVCTask {
++    union {
++        struct HEVCTask *next;          // 用于 executor 调试
++        FFTask task;                    // 继承 FFTask
++    } u;
++
++    HEVCTaskStage stage;                // 当前阶段
++
++    int rx, ry;                         // CTU 坐标 (x, y in CTU units)
++    int rs;                             // CTU 光栅扫描地址
++
++    struct HEVCLayerContext *l;         // layer 上下文
++    struct HEVCFrame *frame;            // 当前帧
++
++    // PARSE 阶段专用
++    struct SliceHeader *sh;             // 当前 slice header
++    int ctu_idx;                        // slice 内 CTU 索引
++    const uint8_t *slice_data;          // slice 数据指针
++    size_t slice_size;                  // slice 数据大小
++
++    // 帧间预测依赖监听器
++    HEVCProgressListener listener[2][HEVC_MAX_REFS];
++
++    // Score-Based 调度
++    atomic_uchar score[HEVC_TASK_STAGE_LAST];
++    atomic_uchar target_inter_score;    // 动态 INTER 阶段目标分数
++} HEVCTask;
++
++// Executor API
++FFExecutor* ff_hevc_executor_alloc(struct HEVCContext *s, int thread_count);
++void ff_hevc_executor_free(FFExecutor **e);
++
++// Frame thread API
++int ff_hevc_frame_thread_init(struct HEVCLayerContext *l, struct HEVCFrame *f,
++                               int ctu_width, int ctu_height, int ctu_size);
++void ff_hevc_frame_thread_free(struct HEVCFrame *f);
++
++// Frame submit/wait API
++int ff_hevc_frame_submit(struct HEVCContext *s, struct HEVCLayerContext *l);
++int ff_hevc_frame_wait(struct HEVCContext *s, struct HEVCLayerContext *l);
++
++// Progress reporting for inter-frame dependencies
++void ff_hevc_report_progress(struct HEVCFrame *f, HEVCProgress idx, int y);
++void ff_hevc_add_progress_listener(struct HEVCFrame *ref, HEVCProgressListener *l);
++
++#endif /* AVCODEC_HEVC_THREAD_H */
+-- 
+2.39.3 (Apple Git-145)
+
